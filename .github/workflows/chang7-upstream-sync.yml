@@ -1,7 +1,7 @@
 name: Chang7 upstream sync
 on:
   schedule:
-    - cron: '2-59/5 * * * *'
+    - cron: '17 */6 * * *'
   workflow_dispatch:
   push:
     paths:
@@ -48,9 +48,22 @@ jobs:
                                      'Accept': 'application/vnd.github+json',
                                      'X-GitHub-Api-Version': '2026-03-10',
                                      'Content-Type': 'application/json'})
-              with build_opener(NoRedirect).open(req, timeout=30) as response:
-                  body = response.read()
-                  return json.loads(body) if body else {}
+              try:
+                  with build_opener(NoRedirect).open(req, timeout=30) as response:
+                      body = response.read()
+                      return json.loads(body) if body else {}
+              except HTTPError as error:
+                  if error.code != 404:
+                      body = error.read(8192).decode('utf-8', errors='replace')
+                      body = body.replace(os.environ['GH_TOKEN'], '[REDACTED]')
+                      print(json.dumps({
+                          'status': 'API_ERROR', 'method': method, 'path': path,
+                          'http_status': error.code, 'response': body,
+                          'request_id': error.headers.get('X-GitHub-Request-Id'),
+                          'accepted_permissions': error.headers.get('X-Accepted-GitHub-Permissions'),
+                          'rate_limit_remaining': error.headers.get('X-RateLimit-Remaining'),
+                          'retry_after': error.headers.get('Retry-After')}), flush=True)
+                  raise
           
           def main():
               name = os.environ['GITHUB_REPOSITORY']
