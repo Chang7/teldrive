@@ -1,9 +1,14 @@
 name: Chang7 upstream sync
+# GITHUB_TOKEN cannot modify workflow files. For those updates, configure
+# UPSTREAM_SYNC_TOKEN with Contents: write and Workflows: write,
+# restricted to this repository (or the three managed forks).
+# A missing/underprivileged token is a failure, never a successful sync.
 on:
   schedule:
-    - cron: '17 */6 * * *'
+    - cron: '37 */6 * * *'
   workflow_dispatch:
   push:
+    branches: ['main']
     paths:
       - '.github/workflows/chang7-upstream-sync.yml'
 permissions:
@@ -13,13 +18,14 @@ concurrency:
   cancel-in-progress: false
 jobs:
   sync:
-    if: github.repository_owner == 'Chang7'
+    if: github.repository_owner == 'Chang7' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Preserve user edits and merge upstream
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          SYNC_TOKEN_CONFIGURED: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
           EXPECTED_REPOSITORY_ID: '1249683427'
         run: |
           python3 - <<'PY'
@@ -74,7 +80,8 @@ jobs:
                                       text=True, capture_output=True, timeout=180)
               if result.returncode:
                   detail = result.stderr + result.stdout
-                  for secret in (env.get('GH_TOKEN'), env.get('GIT_CONFIG_VALUE_0')):
+                  header = env.get('GIT_CONFIG_VALUE_0', '')
+                  for secret in (env.get('GH_TOKEN'), header, header.removeprefix('AUTHORIZATION: basic ')):
                       if secret:
                           detail = detail.replace(secret, '[REDACTED]')
                   raise RuntimeError('git ' + args[0] + ' failed: ' + detail[:8192])
@@ -102,6 +109,15 @@ jobs:
                   raise RuntimeError('Unexpected merged content; refusing to push')
               return candidate
           
+          def require_workflow_token(work, before, candidate, env):
+              paths = git(work, env, 'diff', '--no-renames', '--name-only', '-z', before, candidate).split('\0')
+              workflows = [path for path in paths if path.startswith('.github/workflows/')]
+              if workflows and env.get('SYNC_TOKEN_CONFIGURED') != 'true':
+                  raise RuntimeError('BLOCKED_WORKFLOW_PERMISSION: GITHUB_TOKEN cannot update workflows. '
+                                     'Set the UPSTREAM_SYNC_TOKEN Actions secret to a token limited to this repository '
+                                     'with Contents: write and Workflows: write, then run this workflow again. '
+                                     'No push attempted. Affected files: ' + json.dumps(workflows))
+          
           def native_merge(name, branch, before, source):
               if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', name):
                   raise RuntimeError('Invalid repository name')
@@ -125,6 +141,7 @@ jobs:
                   git(work, env, 'config', 'remote.origin.partialclonefilter', 'blob:none')
                   git(work, env, 'fetch', '--no-tags', '--filter=blob:none', 'origin', before, source)
                   candidate = merge_candidate(work, before, source, env)
+                  require_workflow_token(work, before, candidate, env)
                   current = request('GET', '/repos/' + name + '/branches/' + quote(branch, safe=''))['commit']['sha']
                   if current != before:
                       raise RuntimeError('Target moved during validation; retry from a fresh snapshot')
@@ -161,6 +178,9 @@ jobs:
               after = request('GET', '/repos/' + name + '/branches/' + quote(branch, safe=''))['commit']['sha']
               verify = request('GET', '/repos/' + name + '/compare/' + source + '...' + after)
               assert verify['behind_by'] == 0, 'Upstream is not included in target'
+              assert after == merged['sha'], 'Target moved after push; inspect current history'
+              preserved = request('GET', '/repos/' + name + '/compare/' + before + '...' + after)
+              assert preserved['behind_by'] == 0, 'Previous fork history is not included in target'
               print(json.dumps({'status': 'SYNCED', 'repo': name, 'before': before, 'upstream': source,
                                 'after': after, 'merge': merged.get('sha')}))
           
