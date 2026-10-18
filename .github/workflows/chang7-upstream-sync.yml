@@ -25,6 +25,10 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import base64
+          import re
+          import subprocess
+          import tempfile
           from urllib.request import Request, build_opener, HTTPRedirectHandler
           from urllib.error import HTTPError
           from urllib.parse import quote
@@ -65,6 +69,69 @@ jobs:
                           'retry_after': error.headers.get('Retry-After')}), flush=True)
                   raise
           
+          def git(work, env, *args):
+              result = subprocess.run(['git', '-C', work, *args], env=env,
+                                      text=True, capture_output=True, timeout=180)
+              if result.returncode:
+                  detail = result.stderr + result.stdout
+                  for secret in (env.get('GH_TOKEN'), env.get('GIT_CONFIG_VALUE_0')):
+                      if secret:
+                          detail = detail.replace(secret, '[REDACTED]')
+                  raise RuntimeError('git ' + args[0] + ' failed: ' + detail[:8192])
+              return result.stdout.strip()
+          
+          def merge_candidate(work, before, source, env):
+              # Complete local Git comparisons avoid the REST compare 300-file limit.
+              base = git(work, env, 'merge-base', before, source)
+              changes = git(work, env, 'diff', '--no-renames', '--name-status', '-z', base, before)
+              if changes not in ('', 'A\0' + MANAGED + '\0'):
+                  raise RuntimeError('User changes detected; automatic sync stopped')
+              if git(work, env, 'ls-tree', source, '--', MANAGED):
+                  raise RuntimeError('Upstream uses managed workflow path; review required')
+              tree = git(work, env, 'merge-tree', '--write-tree', before, source).splitlines()[0]
+              if not re.fullmatch(r'[0-9a-f]{40}', tree):
+                  raise RuntimeError('Unexpected merge tree')
+              candidate = git(work, env, 'commit-tree', tree, '-p', before, '-p', source,
+                              '-m', 'chore(sync): merge upstream ' + source[:12])
+              git(work, env, 'merge-base', '--is-ancestor', before, candidate)
+              git(work, env, 'merge-base', '--is-ancestor', source, candidate)
+              if git(work, env, 'ls-tree', before, '--', MANAGED) != git(work, env, 'ls-tree', candidate, '--', MANAGED):
+                  raise RuntimeError('Managed workflow changed during merge')
+              delta = git(work, env, 'diff', '--no-renames', '--name-status', '-z', source, candidate)
+              if delta not in ('', 'A\0' + MANAGED + '\0'):
+                  raise RuntimeError('Unexpected merged content; refusing to push')
+              return candidate
+          
+          def native_merge(name, branch, before, source):
+              if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', name):
+                  raise RuntimeError('Invalid repository name')
+              if not all(re.fullmatch(r'[0-9a-f]{40}', sha) for sha in (before, source)):
+                  raise RuntimeError('Invalid pinned commit')
+              url = 'https://github.com/' + name + '.git'
+              auth = base64.b64encode(('x-access-token:' + os.environ['GH_TOKEN']).encode()).decode()
+              env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_CONFIG_NOSYSTEM='1',
+                         GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_COUNT='2',
+                         GIT_CONFIG_KEY_0='http.' + url + '.extraheader',
+                         GIT_CONFIG_VALUE_0='AUTHORIZATION: basic ' + auth,
+                         GIT_CONFIG_KEY_1='core.hooksPath', GIT_CONFIG_VALUE_1='/dev/null',
+                         GIT_AUTHOR_NAME='github-actions[bot]',
+                         GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com',
+                         GIT_COMMITTER_NAME='github-actions[bot]',
+                         GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com')
+              with tempfile.TemporaryDirectory() as work:
+                  git(work, env, 'init', '--bare', '-q')
+                  git(work, env, 'remote', 'add', 'origin', url)
+                  git(work, env, 'config', 'remote.origin.promisor', 'true')
+                  git(work, env, 'config', 'remote.origin.partialclonefilter', 'blob:none')
+                  git(work, env, 'fetch', '--no-tags', '--filter=blob:none', 'origin', before, source)
+                  candidate = merge_candidate(work, before, source, env)
+                  current = request('GET', '/repos/' + name + '/branches/' + quote(branch, safe=''))['commit']['sha']
+                  if current != before:
+                      raise RuntimeError('Target moved during validation; retry from a fresh snapshot')
+                  # Never force. GitHub's normal permission and branch-policy checks apply.
+                  git(work, env, 'push', 'origin', candidate + ':refs/heads/' + branch)
+                  return {'sha': candidate}
+          
           def main():
               name = os.environ['GITHUB_REPOSITORY']
               repo = request('GET', '/repos/' + name)
@@ -90,10 +157,7 @@ jobs:
                       raise
               else:
                   raise RuntimeError('Upstream uses managed workflow path; review required')
-              # GitHub performs a non-destructive merge; conflicts and protections fail closed.
-              merged = request('POST', '/repos/' + name + '/merges', {
-                  'base': branch, 'head': source,
-                  'commit_message': 'chore(sync): merge upstream ' + source[:12]})
+              merged = native_merge(name, branch, before, source)
               after = request('GET', '/repos/' + name + '/branches/' + quote(branch, safe=''))['commit']['sha']
               verify = request('GET', '/repos/' + name + '/compare/' + source + '...' + after)
               assert verify['behind_by'] == 0, 'Upstream is not included in target'
