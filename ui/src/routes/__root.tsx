@@ -22,6 +22,7 @@ import {
 } from "@tanstack/react-router";
 import { type Ref, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { clearDocumentCache } from "@/features/files/document-cache";
 import { useAppLocale } from "@/lib/locale";
 import { useTheme } from "@/lib/theme";
 import LogoutIcon from "~icons/gravity-ui/arrow-right-from-square";
@@ -43,8 +44,7 @@ import { $api } from "../api/client";
 import { isUnauthorized, userMessage } from "../api/errors";
 import { currentUserQueryOptions } from "../auth/queries";
 import { UploadShelf } from "../components/upload-shelf";
-import { importLegacyEmbeddedTracks } from "../lib/player-settings";
-import { importLegacyPreferences, preferencesQueryOptions } from "../lib/preferences";
+import { preferencesQueryOptions } from "../lib/preferences";
 import { getQueryClient } from "../lib/queryClient";
 
 const mainNav = [
@@ -110,6 +110,7 @@ function Sidebar({
   const signOut = async () => {
     try {
       await logout.mutateAsync({});
+      await clearDocumentCache().catch(() => {});
       getQueryClient().clear();
       onNavigate?.();
       await navigate({ to: "/login", search: { redirect: "/files" }, replace: true });
@@ -550,8 +551,6 @@ export const Route = createRootRouteWithContext<RouterContext>()({
         replace: true,
       });
     }
-    await importLegacyPreferences();
-    await importLegacyEmbeddedTracks();
   },
   component: Layout,
 });
