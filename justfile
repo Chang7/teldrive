@@ -59,11 +59,12 @@ docs-generate: generate-openapi
 generate: generate-api generate-db generate-ui docs-generate nix-generate
     go mod tidy
 
+# Vite generates routeTree.gen.ts, which typechecking needs on a clean checkout.
 ui-check: generate-ui
+    bun run --cwd {{ui_dir}} build
     bun run --cwd {{ui_dir}} lint
     bun run --cwd {{ui_dir}} typecheck
     bun run --cwd {{ui_dir}} test
-    bun run --cwd {{ui_dir}} build
 
 # Run the fully static Astro + Fumadocs documentation site.
 docs-dev: docs-generate
@@ -184,14 +185,11 @@ test-integration:
 test-race:
     ./scripts/test-postgres.sh go test -race -tags=integration ./...
 
-coverage:
-    ./scripts/coverage.sh
-
-check: generate lint test-unit coverage
+check: generate lint test-unit test-integration
+    bun run --cwd {{ui_dir}} build
     bun run --cwd {{ui_dir}} typecheck
     bun run --cwd {{ui_dir}} test
-    bun run --cwd {{ui_dir}} build
     bun run --cwd {{docs_dir}} build
 
 clean-generated:
-    rm -rf openapi internal/api/gen internal/db/sqlcgen ui/src/api/schema.ts ui/dist coverage.out
+    rm -rf openapi internal/api/gen internal/db/sqlcgen ui/src/api/schema.ts ui/dist
